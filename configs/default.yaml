@@ -1,0 +1,70 @@
+seed: 42
+
+data:
+  root: data
+  modalities: [skeleton, silhouette, imu]
+  dummy_data: true
+  num_workers: 2
+
+  sequence:
+    num_frames: 60
+    frame_stride: 1
+
+  skeleton:
+    joints: 17
+    use_confidence: true
+
+  silhouette:
+    image_size: [128, 88]
+
+  imu:
+    sensors: 6
+
+  occlusion:
+    joint_drop_prob: 0.10
+    frame_drop_prob: 0.05
+    silhouette_erase_prob: 0.05
+
+  train:
+    labels_csv: data/labels_train.csv
+    skeleton_dir: data/skeleton/train
+    silhouette_dir: data/silhouette/train
+    imu_dir: data/imu/train
+
+  val:
+    labels_csv: data/labels_val.csv
+    skeleton_dir: data/skeleton/val
+    silhouette_dir: data/silhouette/val
+    imu_dir: data/imu/val
+
+train:
+  batch_size: 4
+  max_epochs: 3
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  optimizer: adamw
+  pd_loss_weight: 1.0
+  severity_loss_weight: 0.5
+  mixed_precision: true
+  log_interval: 10
+
+model:
+  skeleton_encoder:
+    hidden_dim: 128
+    num_layers: 3
+  silhouette_encoder:
+    base_channels: 32
+    hpp_bins: [1, 2, 4]
+  imu_encoder:
+    hidden_dim: 64
+  fusion:
+    type: attention
+    hidden_dim: 256
+  heads:
+    pd_classes: 2
+    severity_classes: 3
+
+eval:
+  save_dir: experiments/default
+  grad_cam: true
+  save_attention: true
