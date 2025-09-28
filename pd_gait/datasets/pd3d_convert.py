@@ -123,42 +123,68 @@ def main() -> None:
 	else:
 		joint_names = json.loads(Path(args.joint_spec).read_text())
 
-	trial_files = sorted(list(raw_dir.rglob(args.glob)))
+    trial_files = sorted(list(raw_dir.rglob(args.glob)))
 	if len(trial_files) == 0:
 		print('No raw trial files found under', raw_dir)
 		return
 
-	metadata_rows = []
-	for trial in trial_files:
-		points3d = load_trial_csv(trial, joint_names)
-		T, J, _ = points3d.shape
-		base_id = trial.stem
-		pd_label = 1 if 'pd' in base_id.lower() else 0
-		severity_label = 0
-		for v in range(args.views):
-			yaw = (360.0 / args.views) * v
-			uv = project_points(points3d, yaw_deg=yaw, pitch_deg=0.0)
-			sample_id = f"{base_id}_v{v}"
-			write_skeleton_npy(data_dir / 'skeleton' / 'train' / f'{sample_id}.npy', uv)
-			synthesize_silhouettes(data_dir / 'silhouette' / 'train' / sample_id)
-			metadata_rows.append({
-				'sample_id': sample_id,
-				'pd_label': pd_label,
-				'severity_label': severity_label,
-				'view_id': v,
-			})
+    # Optional metadata mapping
+    meta_map = {}
+    if args.metadata_csv is not None and args.metadata_csv.exists():
+        mdf = pd.read_csv(args.metadata_csv)
+        key_col = 'trial_id' if 'trial_id' in mdf.columns else ('sample_id' if 'sample_id' in mdf.columns else None)
+        if key_col is not None and 'pd_label' in mdf.columns:
+            for _, r in mdf.iterrows():
+                meta_map[str(r[key_col])] = {
+                    'pd_label': int(r['pd_label']),
+                    'severity_label': int(r['severity_label']) if 'severity_label' in mdf.columns and not np.isnan(r['severity_label']) else -1,
+                }
 
-	# Simple split by sample ids
-	ids = [r['sample_id'] for r in metadata_rows]
-	train_ids, val_ids = split_train_val(ids, val_ratio=0.2)
-	train_rows = [r for r in metadata_rows if r['sample_id'] in train_ids]
-	val_rows = [r for r in metadata_rows if r['sample_id'] in val_ids]
+    # Build sample list first for a consistent train/val split
+    samples = []  # list of dicts with trial, base_id, view_id, labels
+    for trial in trial_files:
+        base_id = trial.stem
+        labels = meta_map.get(base_id, None)
+        pd_label = labels['pd_label'] if labels is not None else (1 if 'pd' in base_id.lower() else 0)
+        severity_label = labels['severity_label'] if labels is not None else -1
+        for v in range(args.views):
+            samples.append({
+                'trial_path': trial,
+                'base_id': base_id,
+                'view_id': v,
+                'pd_label': pd_label,
+                'severity_label': severity_label,
+            })
 
-	import pandas as pd
-	pd.DataFrame(train_rows).to_csv(data_dir / 'labels_train.csv', index=False)
-	pd.DataFrame(val_rows).to_csv(data_dir / 'labels_val.csv', index=False)
-	print('Converted trials:', len(trial_files), 'views per trial:', args.views)
-	print('Wrote labels:', data_dir / 'labels_train.csv', data_dir / 'labels_val.csv')
+    ids = [f"{s['base_id']}_v{s['view_id']}" for s in samples]
+    train_ids, val_ids = split_train_val(ids, val_ratio=0.2)
+    train_set = set(train_ids)
+
+    rows_train = []
+    rows_val = []
+    for s, sid in zip(samples, ids):
+        # Load and project per sample
+        points3d = load_trial_csv(s['trial_path'], joint_names)
+        uv = project_points(points3d, yaw_deg=(360.0 / args.views) * s['view_id'], pitch_deg=0.0)
+        split = 'train' if sid in train_set else 'val'
+        write_skeleton_npy(data_dir / 'skeleton' / split / f'{sid}.npy', uv)
+        synthesize_silhouettes(data_dir / 'silhouette' / split / sid)
+        row = {
+            'sample_id': sid,
+            'pd_label': s['pd_label'],
+            'severity_label': s['severity_label'],
+            'view_id': s['view_id'],
+        }
+        if split == 'train':
+            rows_train.append(row)
+        else:
+            rows_val.append(row)
+
+    pd.DataFrame(rows_train).to_csv(data_dir / 'labels_train.csv', index=False)
+    pd.DataFrame(rows_val).to_csv(data_dir / 'labels_val.csv', index=False)
+    print('Converted trials:', len(trial_files), 'views per trial:', args.views)
+    print('Train samples:', len(rows_train), 'Val samples:', len(rows_val))
+    print('Wrote labels:', data_dir / 'labels_train.csv', data_dir / 'labels_val.csv')
 
 
 if __name__ == '__main__':
