@@ -16,6 +16,14 @@
 			"module": "pd_gait.datasets.pd3d_convert",
 			"args": ["--raw_dir", "data/raw/pd3d", "--data_dir", "data", "--views", "8"],
 			"console": "integratedTerminal"
+		},
+		{
+			"name": "Evaluate (metrics)",
+			"type": "python",
+			"request": "launch",
+			"module": "pd_gait.engine.evaluate",
+			"args": ["--config", "configs/default.yaml", "--ckpt", "experiments/default/best.pt", "--out", "experiments/default/metrics.json"],
+			"console": "integratedTerminal"
 		}
 	]
 }
