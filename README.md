@@ -38,3 +38,13 @@ Notes
 - Severity estimation is optional when labels are present.
 - Multi-view robustness is encouraged via set pooling and view-agnostic encoders.
 
+Datasets
+- PD 3D Kinematics/Kinetics (best fit):
+  - Place raw motion-capture trials under `data/raw/pd3d/` (requires access approval). Then run:
+    python -m pd_gait.datasets.pd3d_convert --raw_dir data/raw/pd3d --data_dir data
+  - If a public mirror becomes available, try the helper (currently placeholder):
+    python -m pd_gait.datasets.pd3d_downloader --raw_dir data/raw/pd3d --try_public_url
+- Daphnet FOG IMU (optional IMU robustness):
+  python -m pd_gait.datasets.daphnet_downloader --out_dir data/raw/daphnet
+  (You can later write a small converter to align IMU files to labels and copy to `data/imu/`.)
+
