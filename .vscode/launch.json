@@ -65,5 +65,13 @@
 			"args": ["--train", "--adversarial_age", "--lambda_age", "0.1"],
 			"console": "integratedTerminal"
 		}
+		,
+		{
+			"name": "Paper Pipeline (Figshare -> Train -> Eval)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/scripts/paper_pipeline.py",
+			"console": "integratedTerminal"
+		}
 	]
 }
