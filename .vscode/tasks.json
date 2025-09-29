@@ -1,0 +1,30 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Create venv",
+			"type": "shell",
+			"command": "python3 -m venv .venv",
+			"problemMatcher": []
+		},
+		{
+			"label": "Install deps",
+			"type": "shell",
+			"command": "source .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt",
+			"problemMatcher": [],
+			"dependsOn": ["Create venv"]
+		},
+		{
+			"label": "Convert PD3D",
+			"type": "shell",
+			"command": "source .venv/bin/activate && python -m pd_gait.datasets.pd3d_convert --raw_dir data/raw/pd3d --data_dir data --views 8",
+			"problemMatcher": []
+		},
+		{
+			"label": "Train",
+			"type": "shell",
+			"command": "source .venv/bin/activate && python train.py --config configs/default.yaml",
+			"problemMatcher": []
+		}
+	]
+}

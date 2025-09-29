@@ -1,0 +1,9 @@
+{
+	"python.defaultInterpreterPath": ".venv/bin/python",
+	"python.terminal.activateEnvironment": true,
+	"python.analysis.typeCheckingMode": "basic",
+	"files.exclude": {
+		"**/__pycache__": true,
+		"**/.venv": true
+	}
+}

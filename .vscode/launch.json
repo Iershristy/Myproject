@@ -1,0 +1,69 @@
+{
+	"version": "0.2.0",
+	"configurations": [
+		{
+			"name": "Train PD Gait",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/train.py",
+			"args": ["--config", "configs/default.yaml"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Convert PD3D",
+			"type": "python",
+			"request": "launch",
+			"module": "pd_gait.datasets.pd3d_convert",
+			"args": ["--raw_dir", "data/raw/pd3d", "--data_dir", "data", "--views", "8"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Evaluate (metrics)",
+			"type": "python",
+			"request": "launch",
+			"module": "pd_gait.engine.evaluate",
+			"args": ["--config", "configs/default.yaml", "--ckpt", "experiments/default/best.pt", "--out", "experiments/default/metrics.json"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Improved)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_improved.py",
+			"args": ["--train"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Subject Agg)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Ordinal Severity)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--ordinal"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Age Covariate)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--age_covariate"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Adversarial Age)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--adversarial_age", "--lambda_age", "0.1"],
+			"console": "integratedTerminal"
+		}
+	]
+}
