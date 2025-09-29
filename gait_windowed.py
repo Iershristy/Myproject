@@ -53,6 +53,9 @@ PATIENCE = 15
 CLIP_MAX_NORM = 1.0
 RANDOM_SEED = 42
 USE_ORDINAL_SEVERITY = False  # set True to try CORAL ordinal loss
+USE_AGE_COVARIATE = False     # concatenate normalized age to pooled features
+USE_AGE_ADVERSARIAL = False   # adversarially remove age with GRL
+LAMBDA_AGE = 0.1              # strength of adversarial age loss
 
 
 def set_seed(seed: int = RANDOM_SEED) -> None:
@@ -69,7 +72,7 @@ def find_gait_file_for_id(dataset_dir: str, subj_id) -> str | None:
     return candidates[0] if candidates else None
 
 
-def load_subject_series(demo_path: str, dataset_dir: str) -> Tuple[List, List[np.ndarray], List[int], List[int]]:
+def load_subject_series(demo_path: str, dataset_dir: str) -> Tuple[List, List[np.ndarray], List[int], List[int], List[float]]:
     # Load demographics
     try:
         df = pd.read_excel(demo_path, engine="xlrd")
@@ -92,6 +95,7 @@ def load_subject_series(demo_path: str, dataset_dir: str) -> Tuple[List, List[np
     series: List[np.ndarray] = []
     pd_list: List[int] = []
     sev_list: List[int] = []
+    ages: List[float] = []
 
     for idx, subj_id in enumerate(df["ID"]):
         fpath = find_gait_file_for_id(dataset_dir, subj_id)
@@ -107,10 +111,20 @@ def load_subject_series(demo_path: str, dataset_dir: str) -> Tuple[List, List[np
             series.append(arr.astype(np.float32))
             pd_list.append(int(pd_labels_all.iloc[idx]))
             sev_list.append(int(sev_labels_all.iloc[idx]))
+            # age may be in 'Age' or similar column; default to NaN -> impute later
+            age_val = None
+            for col in ["Age", "age", "AGE"]:
+                if col in df.columns:
+                    try:
+                        age_val = float(df.loc[idx, col])
+                    except Exception:
+                        age_val = None
+                    break
+            ages.append(np.nan if age_val is None else age_val)
         except Exception as e:
             print(f"Warning: could not load {fpath} for {subj_id}: {e}")
 
-    return ids, series, pd_list, sev_list
+    return ids, series, pd_list, sev_list, ages
 
 
 def make_windows(seq: np.ndarray, wlen: int, hop: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -136,12 +150,15 @@ def make_windows(seq: np.ndarray, wlen: int, hop: int) -> Tuple[np.ndarray, np.n
 
 
 class WindowDataset(Dataset):
-    def __init__(self, windows: np.ndarray, lengths: np.ndarray, pd_labels: np.ndarray, sev_labels: np.ndarray, subj_ids: np.ndarray):
+    def __init__(self, windows: np.ndarray, lengths: np.ndarray, pd_labels: np.ndarray, sev_labels: np.ndarray, subj_ids: np.ndarray, ages: np.ndarray | None = None, age_mean: float | None = None, age_std: float | None = None):
         self.windows = windows
         self.lengths = lengths
         self.pd_labels = pd_labels
         self.sev_labels = sev_labels
         self.subj_ids = subj_ids
+        self.ages = ages  # per-window age
+        self.age_mean = age_mean
+        self.age_std = age_std
 
     def __len__(self):
         return len(self.windows)
@@ -152,7 +169,14 @@ class WindowDataset(Dataset):
         y_pd = torch.tensor(self.pd_labels[idx], dtype=torch.long)
         y_sev = torch.tensor(self.sev_labels[idx], dtype=torch.long)
         sid = torch.tensor(self.subj_ids[idx], dtype=torch.long)
-        return x, L, y_pd, y_sev, sid
+        if self.ages is not None:
+            a = float(self.ages[idx])
+            if self.age_mean is not None and self.age_std is not None and self.age_std > 0:
+                a = (a - self.age_mean) / self.age_std
+            age_t = torch.tensor([a], dtype=torch.float32)
+        else:
+            age_t = torch.tensor([0.0], dtype=torch.float32)
+        return x, L, y_pd, y_sev, sid, age_t
 
 
 class TemporalConvBlock(nn.Module):
@@ -175,8 +199,18 @@ class TemporalConvBlock(nn.Module):
         return self.net(x) + self.res(x)
 
 
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd):
+        ctx.lambd = lambd
+        return x.view_as(x)
+    @staticmethod
+    def backward(ctx, grad_output):
+        return -ctx.lambd * grad_output, None
+
+
 class WindowModel(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS, dropout: float = DROPOUT, num_severity: int = 3, ordinal: bool = False):
+    def __init__(self, input_dim: int, hidden_dim: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS, dropout: float = DROPOUT, num_severity: int = 3, ordinal: bool = False, use_age_covariate: bool = False, use_age_adversarial: bool = False):
         super().__init__()
         # Temporal conv frontend over features
         self.tcnn = nn.Sequential(
@@ -191,8 +225,10 @@ class WindowModel(nn.Module):
         )
         self.bn = nn.BatchNorm1d(hidden_dim * 2)
         self.relu = nn.ReLU()
+        self.use_age_covariate = use_age_covariate
+        fc_in = hidden_dim * 2 + (1 if use_age_covariate else 0)
         self.fc = nn.Sequential(
-            nn.Linear(hidden_dim * 2, 128),
+            nn.Linear(fc_in, 128),
             nn.ReLU(),
             nn.Dropout(dropout),
         )
@@ -203,8 +239,16 @@ class WindowModel(nn.Module):
             self.sev_head = nn.Linear(128, 2)
         else:
             self.sev_head = nn.Linear(128, num_severity)
+        # Adversarial age head (regress normalized age)
+        self.use_age_adversarial = use_age_adversarial
+        if use_age_adversarial:
+            self.age_head = nn.Sequential(
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1)
+            )
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor):
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor, age_cov: torch.Tensor | None = None, lambda_age: float = 0.0):
         # x: (B,T,D)
         b, t, d = x.shape
         h = self.tcnn(x.transpose(1, 2))  # (B, C, T)
@@ -220,10 +264,18 @@ class WindowModel(nn.Module):
         pooled = torch.bmm(attn.unsqueeze(1), out).squeeze(1)
         pooled = self.bn(pooled)
         pooled = self.relu(pooled)
-        z = self.fc(pooled)
+        if self.use_age_covariate and age_cov is not None:
+            z_in = torch.cat([pooled, age_cov], dim=1)
+        else:
+            z_in = pooled
+        z = self.fc(z_in)
         pd_logits = self.pd_head(z)
         sev_logits = self.sev_head(z)
-        return pd_logits, sev_logits
+        age_pred = None
+        if self.use_age_adversarial:
+            z_rev = GradReverse.apply(z, lambda_age)
+            age_pred = self.age_head(z_rev)
+        return pd_logits, sev_logits, age_pred
 
 
 def coral_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -239,8 +291,8 @@ def coral_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     return nn.functional.binary_cross_entropy_with_logits(logits, T, reduction='mean')
 
 
-def build_datasets() -> Tuple[WindowDataset, WindowDataset, int, np.ndarray]:
-    ids, series, pd_list, sev_list = load_subject_series(DEMOGRAPHICS_FILE, DATASET_DIR)
+def build_datasets() -> Tuple[WindowDataset, WindowDataset, int, np.ndarray, dict]:
+    ids, series, pd_list, sev_list, ages = load_subject_series(DEMOGRAPHICS_FILE, DATASET_DIR)
     # subject split by PD label
     subj_idx = np.arange(len(ids))
     pd_arr = np.array(pd_list, dtype=int)
@@ -253,12 +305,21 @@ def build_datasets() -> Tuple[WindowDataset, WindowDataset, int, np.ndarray]:
     scaler = StandardScaler().fit(train_concat)
 
     # Create windows
+    # Age stats on training subjects
+    age_vals_train = []
+    for i in train_idx:
+        age_vals_train.append(ages[i] if ages[i] == ages[i] else np.nan)  # keep NaN
+    age_vals_train = np.array(age_vals_train, dtype=np.float32)
+    age_mean = float(np.nanmean(age_vals_train)) if np.any(~np.isnan(age_vals_train)) else 0.0
+    age_std = float(np.nanstd(age_vals_train) + 1e-6) if np.any(~np.isnan(age_vals_train)) else 1.0
+
     def gen(split_idx):
         windows_list = []
         lengths_list = []
         pdw = []
         sew = []
         sidw = []
+        agew = []
         for i in split_idx:
             seq = series[i]
             seq = scaler.transform(seq)
@@ -269,24 +330,33 @@ def build_datasets() -> Tuple[WindowDataset, WindowDataset, int, np.ndarray]:
             pdw.append(np.full(n, pd_list[i], dtype=np.int64))
             sew.append(np.full(n, sev_list[i], dtype=np.int64))
             sidw.append(np.full(n, i, dtype=np.int64))
+            # replicate subject age to all windows
+            subj_age = ages[i]
+            if subj_age != subj_age:  # NaN
+                subj_age = age_mean
+            agew.append(np.full((n,), subj_age, dtype=np.float32))
         windows = np.concatenate(windows_list, axis=0)
         lengths = np.concatenate(lengths_list, axis=0)
         pdw = np.concatenate(pdw, axis=0)
         sew = np.concatenate(sew, axis=0)
         sidw = np.concatenate(sidw, axis=0)
-        return windows, lengths, pdw, sew, sidw
+        agew_arr = np.concatenate(agew, axis=0)
+        return windows, lengths, pdw, sew, sidw, agew_arr
 
-    Xtr, Ltr, PDtr, SEVtr, SIDtr = gen(train_idx)
-    Xva, Lva, PDva, SEVva, SIDva = gen(val_idx)
-    train_ds = WindowDataset(Xtr, Ltr, PDtr, SEVtr, SIDtr)
-    val_ds = WindowDataset(Xva, Lva, PDva, SEVva, SIDva)
-    return train_ds, val_ds, D, np.array(ids)
+    Xtr, Ltr, PDtr, SEVtr, SIDtr, AGEtr = gen(train_idx)
+    Xva, Lva, PDva, SEVva, SIDva, AGEva = gen(val_idx)
+    train_ds = WindowDataset(Xtr, Ltr, PDtr, SEVtr, SIDtr, AGEtr, age_mean, age_std)
+    val_ds = WindowDataset(Xva, Lva, PDva, SEVva, SIDva, AGEva, age_mean, age_std)
+    return train_ds, val_ds, D, np.array(ids), {"age_mean": age_mean, "age_std": age_std}
 
 
 def train_loop(model: nn.Module,
                train_ds: WindowDataset,
                val_ds: WindowDataset,
-               use_ordinal: bool) -> None:
+               use_ordinal: bool,
+               use_age_covariate: bool,
+               use_age_adversarial: bool,
+               lambda_age: float) -> None:
     # Sampler to balance PD windows
     counts = Counter(train_ds.pd_labels.tolist())
     total = len(train_ds)
@@ -319,10 +389,10 @@ def train_loop(model: nn.Module,
         tr_pd_acc = 0.0
         tr_sev_acc = 0.0
         tr_n = 0
-        for x, L, ypd, ysev, sid in train_loader:
-            x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE)
+        for x, L, ypd, ysev, sid, agev in train_loader:
+            x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE); agev = agev.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
-            pd_logits, sev_logits = model(x, L)
+            pd_logits, sev_logits, age_pred = model(x, L, agev if use_age_covariate else None, lambda_age if use_age_adversarial else 0.0)
             if use_ordinal:
                 sev_loss = coral_loss(sev_logits, ysev)
                 sev_pred = (torch.sigmoid(sev_logits) > 0.5).sum(dim=1)  # back to {0,1,2}
@@ -330,6 +400,9 @@ def train_loop(model: nn.Module,
                 sev_loss = sev_ce(sev_logits, ysev)
                 sev_pred = sev_logits.argmax(dim=1)
             loss = pd_loss(pd_logits, ypd) + sev_loss
+            if use_age_adversarial and age_pred is not None:
+                age_loss = nn.functional.mse_loss(age_pred.squeeze(-1), agev.squeeze(-1))
+                loss = loss + age_loss  # GRL already reverses gradient; adding positive loss is correct
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
             optimizer.step()
@@ -355,9 +428,9 @@ def train_loop(model: nn.Module,
         subj_sev_logits = defaultdict(list)
         subj_sev_true = {}
         with torch.no_grad():
-            for x, L, ypd, ysev, sid in val_loader:
-                x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE)
-                pd_logits, sev_logits = model(x, L)
+            for x, L, ypd, ysev, sid, agev in val_loader:
+                x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE); agev = agev.to(DEVICE)
+                pd_logits, sev_logits, age_pred = model(x, L, agev if use_age_covariate else None, lambda_age if use_age_adversarial else 0.0)
                 if use_ordinal:
                     sev_loss = coral_loss(sev_logits, ysev)
                     sev_pred = (torch.sigmoid(sev_logits) > 0.5).sum(dim=1)
@@ -366,6 +439,9 @@ def train_loop(model: nn.Module,
                     sev_loss = sev_ce(sev_logits, ysev)
                     sev_pred = sev_logits.argmax(dim=1)
                 loss = pd_loss(pd_logits, ypd) + sev_loss
+                if use_age_adversarial and age_pred is not None:
+                    age_loss = nn.functional.mse_loss(age_pred.squeeze(-1), agev.squeeze(-1))
+                    loss = loss + age_loss
                 va_loss += float(loss.item()) * x.size(0)
                 va_n += int(x.size(0))
                 pd_win_correct += int((pd_logits.argmax(dim=1) == ypd).sum().item())
@@ -427,9 +503,9 @@ def train_loop(model: nn.Module,
     subj_sev_logits = defaultdict(list)
     subj_sev_true = {}
     with torch.no_grad():
-        for x, L, ypd, ysev, sid in val_loader:
-            x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE)
-            pd_logits, sev_logits = model(x, L)
+        for x, L, ypd, ysev, sid, agev in val_loader:
+            x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE); agev = agev.to(DEVICE)
+            pd_logits, sev_logits, _ = model(x, L, agev if use_age_covariate else None, lambda_age if use_age_adversarial else 0.0)
             for i in range(x.size(0)):
                 s = int(sid[i].cpu().item())
                 subj_pd_logits[s].append(pd_logits[i].cpu())
@@ -460,13 +536,23 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help="Run training")
     parser.add_argument("--ordinal", action="store_true", help="Use ordinal (CORAL) severity loss")
+    parser.add_argument("--age_covariate", action="store_true", help="Concatenate normalized age to pooled features")
+    parser.add_argument("--adversarial_age", action="store_true", help="Use adversarial GRL to remove age information")
+    parser.add_argument("--lambda_age", type=float, default=LAMBDA_AGE, help="Adversarial age loss strength")
     args = parser.parse_args()
 
     set_seed()
-    train_ds, val_ds, feat_dim, subj_ids = build_datasets()
-    model = WindowModel(input_dim=feat_dim, ordinal=(args.ordinal or USE_ORDINAL_SEVERITY)).to(DEVICE)
+    train_ds, val_ds, feat_dim, subj_ids, age_stats = build_datasets()
+    model = WindowModel(input_dim=feat_dim,
+                        ordinal=(args.ordinal or USE_ORDINAL_SEVERITY),
+                        use_age_covariate=(args.age_covariate or USE_AGE_COVARIATE),
+                        use_age_adversarial=(args.adversarial_age or USE_AGE_ADVERSARIAL)).to(DEVICE)
     if args.train:
-        train_loop(model, train_ds, val_ds, use_ordinal=(args.ordinal or USE_ORDINAL_SEVERITY))
+        train_loop(model, train_ds, val_ds,
+                   use_ordinal=(args.ordinal or USE_ORDINAL_SEVERITY),
+                   use_age_covariate=(args.age_covariate or USE_AGE_COVARIATE),
+                   use_age_adversarial=(args.adversarial_age or USE_AGE_ADVERSARIAL),
+                   lambda_age=args.lambda_age)
 
 
 if __name__ == "__main__":

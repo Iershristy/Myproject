@@ -48,6 +48,22 @@
 			"program": "${workspaceFolder}/gait_windowed.py",
 			"args": ["--train", "--ordinal"],
 			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Age Covariate)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--age_covariate"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Adversarial Age)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--adversarial_age", "--lambda_age", "0.1"],
+			"console": "integratedTerminal"
 		}
 	]
 }
