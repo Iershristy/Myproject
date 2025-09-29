@@ -38,7 +38,7 @@
 			"type": "python",
 			"request": "launch",
 			"program": "${workspaceFolder}/gait_windowed.py",
-			"args": ["--train"],
+			"args": ["--train", "--agg", "vote", "--time_mask_prob", "0.2", "--time_mask_len", "16", "--noise_std", "0.01"],
 			"console": "integratedTerminal"
 		},
 		{

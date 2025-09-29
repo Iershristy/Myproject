@@ -365,11 +365,13 @@ def train_loop(model: nn.Module,
                time_mask_len: int = 0,
                noise_std: float = 0.0,
                tune_threshold: bool = False) -> None:
-    # Sampler to balance PD windows
-    counts = Counter(train_ds.pd_labels.tolist())
+    # Sampler to balance PD and severity jointly
+    pd_counts = Counter(train_ds.pd_labels.tolist())
+    sev_counts = Counter(train_ds.sev_labels.tolist())
     total = len(train_ds)
-    class_weight = {c: total / (2 * counts.get(c, 1)) for c in [0, 1]}
-    sample_weights = np.array([class_weight[int(y)] for y in train_ds.pd_labels], dtype=np.float32)
+    pd_weight = {c: total / (2 * pd_counts.get(c, 1)) for c in [0, 1]}
+    sev_weight = {c: total / (3 * sev_counts.get(c, 1)) for c in [0, 1, 2]}
+    sample_weights = np.array([pd_weight[int(p)] * sev_weight[int(s)] for p, s in zip(train_ds.pd_labels, train_ds.sev_labels)], dtype=np.float32)
     sampler = WeightedRandomSampler(weights=torch.from_numpy(sample_weights), num_samples=len(sample_weights), replacement=True)
 
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, sampler=sampler)
@@ -382,8 +384,22 @@ def train_loop(model: nn.Module,
             sev_counts[c] = 1
     sev_weights = torch.tensor([len(train_ds) / (3 * sev_counts[c]) for c in range(3)], dtype=torch.float32, device=DEVICE)
 
-    pd_loss = nn.CrossEntropyLoss(weight=torch.tensor([class_weight[0], class_weight[1]], dtype=torch.float32, device=DEVICE))
-    sev_ce = nn.CrossEntropyLoss(weight=sev_weights)
+    # PD loss with label smoothing
+    pd_loss = nn.CrossEntropyLoss(weight=torch.tensor([pd_weight[0], pd_weight[1]], dtype=torch.float32, device=DEVICE), label_smoothing=0.05)
+
+    # Severity focal loss
+    class FocalLoss(nn.Module):
+        def __init__(self, weight=None, gamma: float = 2.0):
+            super().__init__()
+            self.weight = weight
+            self.gamma = gamma
+        def forward(self, logits, targets):
+            ce = nn.functional.cross_entropy(logits, targets, weight=self.weight, reduction='none')
+            pt = torch.exp(-ce)
+            loss = ((1 - pt) ** self.gamma) * ce
+            return loss.mean()
+
+    sev_ce = FocalLoss(weight=sev_weights, gamma=2.0)
 
     optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=LR, steps_per_epoch=len(train_loader), epochs=EPOCHS)
@@ -595,6 +611,11 @@ def main():
     parser.add_argument("--age_covariate", action="store_true", help="Concatenate normalized age to pooled features")
     parser.add_argument("--adversarial_age", action="store_true", help="Use adversarial GRL to remove age information")
     parser.add_argument("--lambda_age", type=float, default=LAMBDA_AGE, help="Adversarial age loss strength")
+    parser.add_argument("--agg", type=str, default="vote", choices=["mean", "vote"], help="Subject-level PD aggregation")
+    parser.add_argument("--time_mask_prob", type=float, default=TIME_MASK_PROB)
+    parser.add_argument("--time_mask_len", type=int, default=TIME_MASK_LEN)
+    parser.add_argument("--noise_std", type=float, default=NOISE_STD)
+    parser.add_argument("--tune_threshold", action="store_true", help="Print tuned PD threshold each epoch")
     args = parser.parse_args()
 
     set_seed()
@@ -608,7 +629,12 @@ def main():
                    use_ordinal=(args.ordinal or USE_ORDINAL_SEVERITY),
                    use_age_covariate=(args.age_covariate or USE_AGE_COVARIATE),
                    use_age_adversarial=(args.adversarial_age or USE_AGE_ADVERSARIAL),
-                   lambda_age=args.lambda_age)
+                   lambda_age=args.lambda_age,
+                   agg=args.agg,
+                   time_mask_prob=args.time_mask_prob,
+                   time_mask_len=args.time_mask_len,
+                   noise_std=args.noise_std,
+                   tune_threshold=args.tune_threshold)
 
 
 if __name__ == "__main__":
