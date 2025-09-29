@@ -18,7 +18,7 @@ import os
 from glob import glob
 import pickle
 from collections import Counter, defaultdict
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -65,7 +65,7 @@ def set_seed(seed: int = RANDOM_SEED) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def find_gait_file_for_id(dataset_dir: str, subj_id) -> str | None:
+def find_gait_file_for_id(dataset_dir: str, subj_id) -> Optional[str]:
     candidates: List[str] = []
     candidates += glob(os.path.join(dataset_dir, f"{subj_id}.txt"))
     candidates += glob(os.path.join(dataset_dir, f"{subj_id}_*.txt"))
@@ -150,7 +150,7 @@ def make_windows(seq: np.ndarray, wlen: int, hop: int) -> Tuple[np.ndarray, np.n
 
 
 class WindowDataset(Dataset):
-    def __init__(self, windows: np.ndarray, lengths: np.ndarray, pd_labels: np.ndarray, sev_labels: np.ndarray, subj_ids: np.ndarray, ages: np.ndarray | None = None, age_mean: float | None = None, age_std: float | None = None):
+    def __init__(self, windows: np.ndarray, lengths: np.ndarray, pd_labels: np.ndarray, sev_labels: np.ndarray, subj_ids: np.ndarray, ages: Optional[np.ndarray] = None, age_mean: Optional[float] = None, age_std: Optional[float] = None):
         self.windows = windows
         self.lengths = lengths
         self.pd_labels = pd_labels
@@ -180,7 +180,7 @@ class WindowDataset(Dataset):
 
 
 class TemporalConvBlock(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, k: int = 9, d: int = 1, p: int | None = None, dropout: float = 0.1):
+    def __init__(self, in_ch: int, out_ch: int, k: int = 9, d: int = 1, p: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
         if p is None:
             p = (k - 1) // 2 * d
@@ -248,7 +248,7 @@ class WindowModel(nn.Module):
                 nn.Linear(64, 1)
             )
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor, age_cov: torch.Tensor | None = None, lambda_age: float = 0.0):
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor, age_cov: Optional[torch.Tensor] = None, lambda_age: float = 0.0):
         # x: (B,T,D)
         b, t, d = x.shape
         h = self.tcnn(x.transpose(1, 2))  # (B, C, T)
