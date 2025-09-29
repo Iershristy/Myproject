@@ -56,6 +56,9 @@ USE_ORDINAL_SEVERITY = False  # set True to try CORAL ordinal loss
 USE_AGE_COVARIATE = False     # concatenate normalized age to pooled features
 USE_AGE_ADVERSARIAL = False   # adversarially remove age with GRL
 LAMBDA_AGE = 0.1              # strength of adversarial age loss
+TIME_MASK_PROB = 0.0          # training aug: probability to apply time mask per sample
+TIME_MASK_LEN = 16            # training aug: time mask length
+NOISE_STD = 0.0               # training aug: gaussian noise std added to inputs
 
 
 def set_seed(seed: int = RANDOM_SEED) -> None:
@@ -356,7 +359,12 @@ def train_loop(model: nn.Module,
                use_ordinal: bool,
                use_age_covariate: bool,
                use_age_adversarial: bool,
-               lambda_age: float) -> None:
+               lambda_age: float,
+               agg: str = "mean",
+               time_mask_prob: float = 0.0,
+               time_mask_len: int = 0,
+               noise_std: float = 0.0,
+               tune_threshold: bool = False) -> None:
     # Sampler to balance PD windows
     counts = Counter(train_ds.pd_labels.tolist())
     total = len(train_ds)
@@ -383,6 +391,22 @@ def train_loop(model: nn.Module,
     best_val_pd_acc = -1.0
     wait = 0
 
+    def apply_train_augment(x: torch.Tensor, L: torch.Tensor) -> torch.Tensor:
+        # x: (B,T,D)
+        if noise_std > 0:
+            x = x + noise_std * torch.randn_like(x)
+        if time_mask_prob > 0 and time_mask_len > 0:
+            B, T, D = x.shape
+            for i in range(B):
+                if torch.rand(()) < time_mask_prob:
+                    Li = int(L[i].item())
+                    if Li > 0:
+                        start_max = max(1, Li - time_mask_len)
+                        s = int(torch.randint(0, start_max, (1,)).item())
+                        e = min(Li, s + time_mask_len)
+                        x[i, s:e, :] = 0.0
+        return x
+
     for epoch in range(1, EPOCHS + 1):
         model.train()
         tr_loss = 0.0
@@ -391,6 +415,7 @@ def train_loop(model: nn.Module,
         tr_n = 0
         for x, L, ypd, ysev, sid, agev in train_loader:
             x = x.to(DEVICE); L = L.to(DEVICE); ypd = ypd.to(DEVICE); ysev = ysev.to(DEVICE); agev = agev.to(DEVICE)
+            x = apply_train_augment(x, L)
             optimizer.zero_grad(set_to_none=True)
             pd_logits, sev_logits, age_pred = model(x, L, agev if use_age_covariate else None, lambda_age if use_age_adversarial else 0.0)
             if use_ordinal:
@@ -425,6 +450,7 @@ def train_loop(model: nn.Module,
         sev_win_correct = 0
         subj_pd_logits = defaultdict(list)
         subj_pd_true = {}
+        subj_pd_votes = defaultdict(list)
         subj_sev_logits = defaultdict(list)
         subj_sev_true = {}
         with torch.no_grad():
@@ -450,6 +476,7 @@ def train_loop(model: nn.Module,
                 for i in range(x.size(0)):
                     s = int(sid[i].cpu().item())
                     subj_pd_logits[s].append(pd_logits[i].cpu())
+                    subj_pd_votes[s].append(int(pd_logits[i].argmax().item()))
                     subj_pd_true[s] = int(ypd[i].cpu().item())
                     if not use_ordinal:
                         subj_sev_logits[s].append(sev_logits[i].cpu())
@@ -459,13 +486,25 @@ def train_loop(model: nn.Module,
         pd_win_acc = pd_win_correct / max(va_n, 1)
         sev_win_acc = sev_win_correct / max(va_n, 1)
 
-        # Subject-level metrics (by mean logits)
+        # Subject-level metrics
         pd_subj_pred = []
         pd_subj_true = []
-        for s, logits_list in subj_pd_logits.items():
-            mean_logits = torch.stack(logits_list, dim=0).mean(dim=0)
-            pd_subj_pred.append(int(mean_logits.argmax().item()))
-            pd_subj_true.append(subj_pd_true[s])
+        if agg == "vote":
+            for s, votes in subj_pd_votes.items():
+                # majority vote, tie-breaker by mean logits
+                counts = Counter(votes)
+                if counts[0] == counts[1]:
+                    mean_logits = torch.stack(subj_pd_logits[s], dim=0).mean(dim=0)
+                    pred = int(mean_logits.argmax().item())
+                else:
+                    pred = 0 if counts[0] > counts[1] else 1
+                pd_subj_pred.append(pred)
+                pd_subj_true.append(subj_pd_true[s])
+        else:
+            for s, logits_list in subj_pd_logits.items():
+                mean_logits = torch.stack(logits_list, dim=0).mean(dim=0)
+                pd_subj_pred.append(int(mean_logits.argmax().item()))
+                pd_subj_true.append(subj_pd_true[s])
         pd_subj_acc = accuracy_score(pd_subj_true, pd_subj_pred) if len(pd_subj_true) else 0.0
 
         if not use_ordinal and len(subj_sev_logits):
@@ -481,6 +520,23 @@ def train_loop(model: nn.Module,
 
         print(f"Epoch {epoch}/{EPOCHS} -- TrainLoss: {tr_loss:.4f}, Train PD Acc: {tr_pd:.3f}, Train Sev Acc: {tr_sev:.3f} "
               f"| ValLoss: {va_loss:.4f}, Val PD(win) Acc: {pd_win_acc:.3f}, Val PD(subj) Acc: {pd_subj_acc:.3f}, Val Sev(subj) Acc: {sev_subj_acc:.3f}")
+
+        if tune_threshold and len(subj_pd_logits):
+            # threshold tuning on subject-level mean probability
+            proba = []
+            for s, logits_list in subj_pd_logits.items():
+                mean_logits = torch.stack(logits_list, dim=0).mean(dim=0)
+                p = torch.softmax(mean_logits, dim=0)[1].item()
+                proba.append(p)
+            ytrue = np.array(pd_subj_true)
+            proba = np.array(proba)
+            best_acc, best_th = 0.0, 0.5
+            for th in np.linspace(0.3, 0.7, 41):
+                ypred = (proba >= th).astype(int)
+                acc = accuracy_score(ytrue, ypred)
+                if acc > best_acc:
+                    best_acc, best_th = acc, th
+            print(f"  tuned threshold -> PD(subj) Acc: {best_acc:.3f} @ thr={best_th:.2f}")
 
         # Early stopping on subject-level PD accuracy
         if pd_subj_acc > best_val_pd_acc:
