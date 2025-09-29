@@ -32,6 +32,22 @@
 			"program": "${workspaceFolder}/gait_improved.py",
 			"args": ["--train"],
 			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Subject Agg)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train"],
+			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Windowed + Ordinal Severity)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_windowed.py",
+			"args": ["--train", "--ordinal"],
+			"console": "integratedTerminal"
 		}
 	]
 }
