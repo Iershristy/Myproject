@@ -24,6 +24,14 @@
 			"module": "pd_gait.engine.evaluate",
 			"args": ["--config", "configs/default.yaml", "--ckpt", "experiments/default/best.pt", "--out", "experiments/default/metrics.json"],
 			"console": "integratedTerminal"
+		},
+		{
+			"name": "Train PhysioNet (Improved)",
+			"type": "python",
+			"request": "launch",
+			"program": "${workspaceFolder}/gait_improved.py",
+			"args": ["--train"],
+			"console": "integratedTerminal"
 		}
 	]
 }
