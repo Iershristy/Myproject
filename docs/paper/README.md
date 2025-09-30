@@ -7,12 +7,14 @@ This folder contains the IEEE double-column LaTeX manuscript for:
 
 ## Files
 - `main.tex`: Main LaTeX source
+- `results.tex`: Results-focused PDF with tables and graphs
 
 ## Quick Build (local)
 Requires a LaTeX distribution with `latexmk` and `pdflatex`.
 
 ```bash
 latexmk -pdf -interaction=nonstopmode -halt-on-error docs/paper/main.tex
+latexmk -pdf -interaction=nonstopmode -halt-on-error docs/paper/results.tex
 ```
 
 The output PDF will be `docs/paper/main.pdf`.
@@ -24,7 +26,7 @@ debian_frontend=noninteractive sudo apt-get update && sudo apt-get install -y te
 ```
 
 ## GitHub Actions (auto-build)
-A workflow is provided at `.github/workflows/latex.yml` that builds the PDF on every push. After the run finishes, download the artifact named `paper-pdf` from the workflow page to get the compiled PDF.
+A workflow is provided at `.github/workflows/latex.yml` that builds the PDFs on every push. After the run finishes, download the artifacts named `paper-pdf` and `results-pdf` from the workflow page to get the compiled PDFs.
 
 ## Notes
 - Replace the placeholder author block in `main.tex` with your details.
