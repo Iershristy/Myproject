@@ -7,9 +7,11 @@
 \usepackage{graphicx}
 \usepackage{booktabs}
 \usepackage{stfloats}
+\usepackage{pgfplots}
 \usepackage{hyperref}
 \usepackage{balance}
 \usepackage{url}
+\pgfplotsset{compat=1.18}
 
 % Hyphenation
 \hyphenation{op-tical net-works semi-conduc-tor}
@@ -164,6 +166,57 @@ LSTM-only                & 87 & 64 \\
 \bottomrule
 \end{tabular}
 \end{table*}
+
+\subsection{Graphical Summary}
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar,
+  width=\linewidth,
+  height=5cm,
+  enlargelimits=0.15,
+  ylabel={Accuracy (\%)},
+  symbolic x coords={Full,-Attn,-MS-CNN,CE,-Aug},
+  xtick=data,
+  legend style={at={(0.5,1.05)},anchor=south,legend columns=-1},
+  ymin=55,ymax=100,
+  bar width=8pt
+]
+\addplot coordinates {(Full,92) (-Attn,87) (-MS-CNN,90) (CE,90) (-Aug,85)};
+\addlegendentry{PD}
+\addplot coordinates {(Full,70) (-Attn,66) (-MS-CNN,62) (CE,60) (-Aug,63)};
+\addlegendentry{Severity}
+\end{axis}
+\end{tikzpicture}
+\caption{Ablation accuracy for PD and Severity.}
+\end{figure}
+
+\begin{figure}[t]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  ybar,
+  width=\linewidth,
+  height=5cm,
+  enlargelimits=0.15,
+  ylabel={Score},
+  symbolic x coords={Mild,Moderate,Severe},
+  xtick=data,
+  legend style={at={(0.5,1.05)},anchor=south,legend columns=-1},
+  ymin=0,ymax=1,
+  bar width=8pt
+]
+\addplot coordinates {(Mild,0.75) (Moderate,0.67) (Severe,0.67)};
+\addlegendentry{Precision}
+\addplot coordinates {(Mild,0.60) (Moderate,0.80) (Severe,0.67)};
+\addlegendentry{Recall}
+\addplot coordinates {(Mild,0.67) (Moderate,0.73) (Severe,0.67)};
+\addlegendentry{F1}
+\end{axis}
+\end{tikzpicture}
+\caption{Class-wise Severity metrics.}
+\end{figure}
 
 \section{Discussion}
 The observed performance approaches expert-level screening for PD and offers informative severity estimates that complement clinical judgment. Attention weights can be visualized to highlight salient gait phases. Limitations include a modest cohort size, a single sensing modality, and potential domain shift. Future work will explore multi-modal fusion (e.g., IMU), transfer learning from large gait corpora, and explainability tools tailored to clinical review.
