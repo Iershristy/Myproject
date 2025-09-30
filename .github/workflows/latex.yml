@@ -39,3 +39,14 @@ jobs:
         with:
           name: results-pdf
           path: docs/paper/results.pdf
+
+      - name: Compile ieee_pd_gait.tex
+        uses: xu-cheng/latex-action@v3
+        with:
+          root_file: docs/paper/ieee_pd_gait.tex
+
+      - name: Upload User Paper PDF artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ieee-pd-gait-pdf
+          path: docs/paper/ieee_pd_gait.pdf
