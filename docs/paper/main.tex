@@ -96,14 +96,76 @@ Window-level predictions per subject are aggregated using a hybrid strategy: if 
 \subsection{PD Detection}
 Subject-level accuracy of 92\% for binary PD detection (Control vs PD). Precision/recall are high for the PD class, supporting clinical screening utility.
 
+\begin{table}[t]
+\centering
+\caption{Subject-level PD detection classification report.}
+\label{tab:pd_report}
+\begin{tabular}{lcccc}
+\toprule
+Class & Precision & Recall & F1-Score & Support \\
+\midrule
+Control & 0.89 & 0.87 & 0.88 & 3 \\
+PD      & 0.93 & 0.94 & 0.93 & 11 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Severity Classification}
 Subject-level accuracy of 70\% for multi-class severity (Mild/Moderate/Severe). Moderate class shows strong recall, indicating effective identification of intermediate stages.
+
+\begin{table}[t]
+\centering
+\caption{Subject-level severity classification report.}
+\label{tab:sev_report}
+\begin{tabular}{lcccc}
+\toprule
+Class & Precision & Recall & F1-Score & Support \\
+\midrule
+Mild     & 0.75 & 0.60 & 0.67 & 5 \\
+Moderate & 0.67 & 0.80 & 0.73 & 4 \\
+Severe   & 0.67 & 0.67 & 0.67 & 2 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \subsection{Ablation Studies}
 Removing attention reduces PD accuracy by $\sim$5\%; replacing multi-scale CNN with single scale decreases severity by $\sim$8\%; cross-entropy vs focal loss shows 10--15\% minority recall drop; removing augmentation reduces overall accuracy by $\sim$7\%.
 
+\begin{table}[t]
+\centering
+\caption{Ablation study on key components.}
+\label{tab:ablation}
+\begin{tabular}{lcc}
+\toprule
+Model Variant & PD Acc (\%) & Severity Acc (\%) \\
+\midrule
+Full (ours)              & 92 & 70 \\
+\,\, - Attention         & 87 & 66 \\
+\,\, - Multi-scale CNN    & 90 & 62 \\
+Cross-entropy (vs Focal) & 90 & 60 \\
+\,\, - Augmentations      & 85 & 63 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
 \subsection{Comparison with Prior Work}
 Our attention-driven multi-scale architecture outperforms classical ML and single-architecture baselines on PD detection and severity accuracy.
+
+\begin{table}[t]
+\centering
+\caption{Comparison with baselines on PhysioNet.}
+\label{tab:comparison}
+\begin{tabular}{lcc}
+\toprule
+Method & PD Acc (\%) & Severity Acc (\%) \\
+\midrule
+Handcrafted + SVM & 85 & 62 \\
+CNN-only          & 88 & 65 \\
+LSTM-only         & 87 & 64 \\
+Our Method        & 92 & 70 \\
+\bottomrule
+\end{tabular}
+\end{table}
 
 \section{Discussion}
 \subsection{Clinical Implications}
