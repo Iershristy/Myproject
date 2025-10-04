@@ -37,6 +37,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from contextlib import nullcontext
 from torch.optim.swa_utils import AveragedModel
 
 # ==================== CONFIG ====================
@@ -65,7 +66,8 @@ TIME_MASK_LEN = 48
 NOISE_STD = 0.03
 
 # TTA
-TTA_N = 4
+TTA_N = 4           # final evaluation TTA passes
+VAL_TTA_N = 1       # per-epoch validation TTA passes (lower for speed)
 
 # Focal (PD)
 FOCAL_ALPHA = 0.25
@@ -77,6 +79,14 @@ EMA_DECAY = 0.999
 # SAM
 SAM_RHO = 0.05
 SAM_ADAPTIVE = True
+
+# Runtime/loader defaults (tunable via CLI)
+NUM_WORKERS = 0
+USE_FREQ = True
+USE_SAM = True
+USE_AMP = False
+COMPILE_MODEL = False
+VAL_INTERVAL = 5
 
 
 # ==================== UTIL & DATA ====================
@@ -259,8 +269,9 @@ class FreqBlock(nn.Module):
 
 
 class DualStreamEncoder(nn.Module):
-    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, dropout: float):
+    def __init__(self, input_dim: int, hidden_dim: int, num_layers: int, dropout: float, use_freq: bool = True):
         super().__init__()
+        self.use_freq = use_freq
         # Temporal path (time-domain)
         self.tcnn = nn.Sequential(
             EnhancedTemporalBlock(input_dim, 64, dropout),
@@ -276,20 +287,21 @@ class DualStreamEncoder(nn.Module):
         self.t_ln2 = nn.LayerNorm(hidden_dim * 2)
 
         # Frequency path (rFFT on time dimension)
-        # Input to convs: [B, D, F]
-        self.fcnn = nn.Sequential(
-            FreqBlock(input_dim, 96, dropout),
-            FreqBlock(96, 160, dropout),
-            FreqBlock(160, 224, dropout),
-        )
-        self.f_attn = nn.MultiheadAttention(224, num_heads=8, dropout=dropout, batch_first=True)
-        self.f_ln = nn.LayerNorm(224)
+        if self.use_freq:
+            # Input to convs: [B, D, F]
+            self.fcnn = nn.Sequential(
+                FreqBlock(input_dim, 96, dropout),
+                FreqBlock(96, 160, dropout),
+                FreqBlock(160, 224, dropout),
+            )
+            self.f_attn = nn.MultiheadAttention(224, num_heads=8, dropout=dropout, batch_first=True)
+            self.f_ln = nn.LayerNorm(224)
 
         # Fusion dims
         self.out_dim_temporal = hidden_dim * 2
-        self.out_dim_freq = 224
+        self.out_dim_freq = 224 if self.use_freq else 0
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         # x: [B, T, D]
         B, T, D = x.shape
         device = x.device
@@ -306,25 +318,27 @@ class DualStreamEncoder(nn.Module):
         denom = valid.sum(dim=1, keepdim=True).clamp(min=1.0)
         t_pooled = (t_attn * valid.unsqueeze(-1)).sum(dim=1) / denom  # [B, 2H]
 
-        # Frequency path
-        # rFFT magnitude along time axis
-        fmag = torch.fft.rfft(x, dim=1).abs()  # [B, F, D]
-        f_in = fmag.transpose(1, 2)            # [B, D, F]
-        f = self.fcnn(f_in)                     # [B, 224, F]
-        f = f.transpose(1, 2)                   # [B, F, 224]
-        f_attn, _ = self.f_attn(f, f, f)      # no mask; F fixed per window
-        f_attn = self.f_ln(f_attn)
-        f_pooled = f_attn.mean(dim=1)          # [B, 224]
+        # Frequency path (optional)
+        f_pooled = None
+        if self.use_freq:
+            # rFFT magnitude along time axis
+            fmag = torch.fft.rfft(x, dim=1).abs()  # [B, F, D]
+            f_in = fmag.transpose(1, 2)            # [B, D, F]
+            f = self.fcnn(f_in)                     # [B, 224, F]
+            f = f.transpose(1, 2)                   # [B, F, 224]
+            f_attn, _ = self.f_attn(f, f, f)      # no mask; F fixed per window
+            f_attn = self.f_ln(f_attn)
+            f_pooled = f_attn.mean(dim=1)          # [B, 224]
 
         # Return stream embeddings and concatenated fusion
-        fused = torch.cat([t_pooled, f_pooled], dim=1)     # [B, 2H + 224]
+        fused = torch.cat([t_pooled, f_pooled], dim=1) if self.use_freq else t_pooled
         return fused, t_pooled, f_pooled
 
 
 class PDModel(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, use_freq: bool = True):
         super().__init__()
-        self.enc = DualStreamEncoder(input_dim, HIDDEN_DIM, NUM_LAYERS, DROPOUT)
+        self.enc = DualStreamEncoder(input_dim, HIDDEN_DIM, NUM_LAYERS, DROPOUT, use_freq=use_freq)
         in_dim = self.enc.out_dim_temporal + self.enc.out_dim_freq
         self.head = nn.Sequential(
             nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(DROPOUT),
@@ -338,9 +352,9 @@ class PDModel(nn.Module):
 
 
 class SevModel(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, use_freq: bool = True):
         super().__init__()
-        self.enc = DualStreamEncoder(input_dim, HIDDEN_DIM, NUM_LAYERS, DROPOUT)
+        self.enc = DualStreamEncoder(input_dim, HIDDEN_DIM, NUM_LAYERS, DROPOUT, use_freq=use_freq)
         in_dim = self.enc.out_dim_temporal + self.enc.out_dim_freq
         self.head = nn.Sequential(
             nn.Linear(in_dim, 256), nn.LayerNorm(256), nn.GELU(), nn.Dropout(DROPOUT),
@@ -439,8 +453,9 @@ def apply_augmentations(x: torch.Tensor, L: torch.Tensor,
     return x
 
 
-def tta_logits(model: nn.Module, x: torch.Tensor, L: torch.Tensor, num_classes: int, n: int = TTA_N) -> torch.Tensor:
+def tta_logits(model: nn.Module, x: torch.Tensor, L: torch.Tensor, num_classes: int, n: int = TTA_N, use_amp: bool = False) -> torch.Tensor:
     # Average probabilities across TTA variants
+    autocast = torch.cuda.amp.autocast if (use_amp and DEVICE.type == 'cuda') else nullcontext
     with torch.no_grad():
         probs_accum = torch.zeros((x.size(0), num_classes), device=x.device)
         for k in range(n):
@@ -450,8 +465,9 @@ def tta_logits(model: nn.Module, x: torch.Tensor, L: torch.Tensor, num_classes: 
                 xa = x + NOISE_STD * torch.randn_like(x)
             else:
                 xa = apply_augmentations(x.clone(), L)
-            logits = model(xa, L)
-            probs = F.softmax(logits, dim=1)
+            with autocast():
+                logits = model(xa, L)
+                probs = F.softmax(logits, dim=1)
             probs_accum += probs
         probs_mean = probs_accum / float(n)
         return probs_mean
@@ -496,48 +512,73 @@ def build_datasets() -> Tuple[WindowDataset, WindowDataset, int]:
 
 
 # ==================== TRAIN LOOPS ====================
-def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDataset):
+def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDataset,
+                   use_sam: bool = USE_SAM, num_workers: int = NUM_WORKERS,
+                   val_interval: int = VAL_INTERVAL, val_tta_n: int = VAL_TTA_N,
+                   use_amp: bool = USE_AMP):
     # PD-balanced sampling
     pd_counts = Counter(train_ds.pd_labels.tolist())
     pd_w = {c: len(train_ds) / (2 * max(pd_counts.get(c, 1), 1)) for c in [0, 1]}
     sample_weights = np.array([pd_w[int(y)] for y in train_ds.pd_labels], dtype=np.float32)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              sampler=WeightedRandomSampler(torch.from_numpy(sample_weights), len(sample_weights), replacement=True))
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE,
+        sampler=WeightedRandomSampler(torch.from_numpy(sample_weights), len(sample_weights), replacement=True),
+        num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), persistent_workers=(num_workers > 0)
+    )
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), persistent_workers=(num_workers > 0))
 
     pd_weights = torch.tensor([pd_w[0], pd_w[1]], dtype=torch.float32, device=DEVICE)
     criterion = FocalLoss(weight=pd_weights)
 
     base_opt = lambda params, **kw: optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-    optimizer = SAM(model.parameters(), base_optimizer=base_opt, rho=SAM_RHO, adaptive=SAM_ADAPTIVE, lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer.base_optimizer, T_0=12, T_mult=2)
+    if use_sam:
+        optimizer = SAM(model.parameters(), base_optimizer=base_opt, rho=SAM_RHO, adaptive=SAM_ADAPTIVE, lr=LR, weight_decay=WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer.base_optimizer, T_0=12, T_mult=2)
+    else:
+        optimizer = base_opt(model.parameters())
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=12, T_mult=2)
 
     ema_model = AveragedModel(model, avg_fn=lambda avg, p, n: EMA_DECAY * avg + (1.0 - EMA_DECAY) * p)
 
     best_pd, wait = 0.0, 0
     for epoch in range(1, EPOCHS_PD + 1):
         model.train()
+        autocast = torch.cuda.amp.autocast if (use_amp and DEVICE.type == 'cuda') else torch.cpu.amp.autocast
         for x, L, ypd, _, _ in train_loader:
             x, L, ypd = x.to(DEVICE), L.to(DEVICE), ypd.to(DEVICE)
             xa = apply_augmentations(x, L)
 
-            # SAM two-step
-            logits = model(xa, L)
-            loss = criterion(logits, ypd)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
-            optimizer.first_step(zero_grad=True)
+            if use_sam:
+                # SAM two-step
+                with autocast():
+                    logits = model(xa, L)
+                    loss = criterion(logits, ypd)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.first_step(zero_grad=True)
 
-            # second forward/backward
-            logits2 = model(xa, L)
-            loss2 = criterion(logits2, ypd)
-            loss2.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
-            optimizer.second_step(zero_grad=True)
+                with autocast():
+                    logits2 = model(xa, L)
+                    loss2 = criterion(logits2, ypd)
+                loss2.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.second_step(zero_grad=True)
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                with autocast():
+                    logits = model(xa, L)
+                    loss = criterion(logits, ypd)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.step()
 
             # EMA update after optimizer step
             ema_model.update_parameters(model)
-        scheduler.step(epoch + 1)
+        if isinstance(scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
+            scheduler.step(epoch + 1)
+        else:
+            scheduler.step()
 
         # Validation with EMA weights + TTA
         ema_model.eval()
@@ -545,7 +586,7 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
         with torch.no_grad():
             for x, L, ypd, _, sid in val_loader:
                 x, L = x.to(DEVICE), L.to(DEVICE)
-                probs = tta_logits(ema_model, x, L, num_classes=2, n=TTA_N)
+                probs = tta_logits(ema_model, x, L, num_classes=2, n=val_tta_n, use_amp=use_amp)
                 for i in range(x.size(0)):
                     s = int(sid[i].item())
                     subj_probs[s].append(probs[i].cpu())
@@ -556,7 +597,7 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
             p = int(mean_prob.argmax().item())
             preds.append(p); trues.append(subj_true[s])
         pd_acc = accuracy_score(trues, preds)
-        if epoch % 5 == 0 or epoch == 1:
+        if epoch % val_interval == 0 or epoch == 1:
             print(f"[PD] Epoch {epoch:3d}/{EPOCHS_PD} | Val PD Acc: {pd_acc:.3f}")
 
         if pd_acc > best_pd:
@@ -573,46 +614,72 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
     return best_pd
 
 
-def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowDataset):
+def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowDataset,
+                    use_sam: bool = USE_SAM, num_workers: int = NUM_WORKERS,
+                    val_interval: int = VAL_INTERVAL, val_tta_n: int = VAL_TTA_N,
+                    use_amp: bool = USE_AMP):
     # Severity-focused sampling
     sev_counts = Counter(train_ds.sev_labels.tolist())
     sev_w = {c: len(train_ds) / (3 * max(sev_counts.get(c, 1), 1)) for c in [0, 1, 2]}
     sample_weights = np.array([sev_w[int(y)] for y in train_ds.sev_labels], dtype=np.float32)
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE,
-                              sampler=WeightedRandomSampler(torch.from_numpy(sample_weights), len(sample_weights), replacement=True))
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE,
+        sampler=WeightedRandomSampler(torch.from_numpy(sample_weights), len(sample_weights), replacement=True),
+        num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), persistent_workers=(num_workers > 0)
+    )
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), persistent_workers=(num_workers > 0))
 
     sev_weights = torch.tensor([sev_w[0], sev_w[1], sev_w[2]], dtype=torch.float32, device=DEVICE)
     criterion = nn.CrossEntropyLoss(weight=sev_weights, label_smoothing=0.05)
 
     base_opt = lambda params, **kw: optim.AdamW(params, lr=LR, weight_decay=WEIGHT_DECAY)
-    optimizer = SAM(model.parameters(), base_optimizer=base_opt, rho=SAM_RHO, adaptive=SAM_ADAPTIVE, lr=LR, weight_decay=WEIGHT_DECAY)
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer.base_optimizer, T_0=12, T_mult=2)
+    if use_sam:
+        optimizer = SAM(model.parameters(), base_optimizer=base_opt, rho=SAM_RHO, adaptive=SAM_ADAPTIVE, lr=LR, weight_decay=WEIGHT_DECAY)
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer.base_optimizer, T_0=12, T_mult=2)
+    else:
+        optimizer = base_opt(model.parameters())
+        scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=12, T_mult=2)
 
     ema_model = AveragedModel(model, avg_fn=lambda avg, p, n: EMA_DECAY * avg + (1.0 - EMA_DECAY) * p)
 
     best_sev, wait = 0.0, 0
     for epoch in range(1, EPOCHS_SEV + 1):
         model.train()
+        autocast = torch.cuda.amp.autocast if (use_amp and DEVICE.type == 'cuda') else torch.cpu.amp.autocast
         for x, L, _, ysev, _ in train_loader:
             x, L, ysev = x.to(DEVICE), L.to(DEVICE), ysev.to(DEVICE)
             xa = apply_augmentations(x, L)
 
-            # SAM two-step
-            logits = model(xa, L)
-            loss = criterion(logits, ysev)
-            loss.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
-            optimizer.first_step(zero_grad=True)
+            if use_sam:
+                # SAM two-step
+                with autocast():
+                    logits = model(xa, L)
+                    loss = criterion(logits, ysev)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.first_step(zero_grad=True)
 
-            logits2 = model(xa, L)
-            loss2 = criterion(logits2, ysev)
-            loss2.backward()
-            nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
-            optimizer.second_step(zero_grad=True)
+                with autocast():
+                    logits2 = model(xa, L)
+                    loss2 = criterion(logits2, ysev)
+                loss2.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.second_step(zero_grad=True)
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                with autocast():
+                    logits = model(xa, L)
+                    loss = criterion(logits, ysev)
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), CLIP_MAX_NORM)
+                optimizer.step()
 
             ema_model.update_parameters(model)
-        scheduler.step(epoch + 1)
+        if isinstance(scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
+            scheduler.step(epoch + 1)
+        else:
+            scheduler.step()
 
         # Validation with EMA weights + TTA
         ema_model.eval()
@@ -620,7 +687,7 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
         with torch.no_grad():
             for x, L, _, ysev, sid in val_loader:
                 x, L = x.to(DEVICE), L.to(DEVICE)
-                probs = tta_logits(ema_model, x, L, num_classes=3, n=TTA_N)
+                probs = tta_logits(ema_model, x, L, num_classes=3, n=val_tta_n, use_amp=use_amp)
                 for i in range(x.size(0)):
                     s = int(sid[i].item())
                     subj_probs[s].append(probs[i].cpu())
@@ -631,7 +698,7 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
             p = int(mean_prob.argmax().item())
             preds.append(p); trues.append(subj_true[s])
         sev_acc = accuracy_score(trues, preds)
-        if epoch % 5 == 0 or epoch == 1:
+        if epoch % val_interval == 0 or epoch == 1:
             print(f"[SEV] Epoch {epoch:3d}/{EPOCHS_SEV} | Val Sev Acc: {sev_acc:.3f}")
 
         if sev_acc > best_sev:
@@ -648,8 +715,10 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
 
 
 # ==================== EVALUATION ====================
-def evaluate(pd_model: PDModel, sev_model: SevModel, val_ds: WindowDataset):
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False)
+def evaluate(pd_model: PDModel, sev_model: SevModel, val_ds: WindowDataset,
+             num_workers: int = NUM_WORKERS, tta_n: int = TTA_N, use_amp: bool = USE_AMP):
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False,
+                            num_workers=num_workers, pin_memory=(DEVICE.type == 'cuda'), persistent_workers=(num_workers > 0))
 
     # PD eval
     pd_model.eval()
@@ -657,7 +726,7 @@ def evaluate(pd_model: PDModel, sev_model: SevModel, val_ds: WindowDataset):
     with torch.no_grad():
         for x, L, ypd, _, sid in val_loader:
             x, L = x.to(DEVICE), L.to(DEVICE)
-            probs = tta_logits(pd_model, x, L, num_classes=2, n=TTA_N)
+            probs = tta_logits(pd_model, x, L, num_classes=2, n=tta_n, use_amp=use_amp)
             for i in range(x.size(0)):
                 s = int(sid[i].item())
                 subj_pd_probs[s].append(probs[i].cpu())
@@ -675,7 +744,7 @@ def evaluate(pd_model: PDModel, sev_model: SevModel, val_ds: WindowDataset):
     with torch.no_grad():
         for x, L, _, ysev, sid in val_loader:
             x, L = x.to(DEVICE), L.to(DEVICE)
-            probs = tta_logits(sev_model, x, L, num_classes=3, n=TTA_N)
+            probs = tta_logits(sev_model, x, L, num_classes=3, n=tta_n, use_amp=use_amp)
             for i in range(x.size(0)):
                 s = int(sid[i].item())
                 subj_sev_probs[s].append(probs[i].cpu())
@@ -704,6 +773,15 @@ def evaluate(pd_model: PDModel, sev_model: SevModel, val_ds: WindowDataset):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true", help="Run training")
+    # speed/runtime flags
+    parser.add_argument("--no-sam", action="store_true", help="Disable SAM (use plain AdamW)")
+    parser.add_argument("--amp", action="store_true", help="Enable mixed precision training/eval")
+    parser.add_argument("--workers", type=int, default=NUM_WORKERS, help="DataLoader workers")
+    parser.add_argument("--no-freq", action="store_true", help="Disable frequency stream for speed")
+    parser.add_argument("--compile", action="store_true", help="torch.compile models (PyTorch 2.x)")
+    parser.add_argument("--val-interval", type=int, default=VAL_INTERVAL, help="Validate every N epochs")
+    parser.add_argument("--val-tta", type=int, default=VAL_TTA_N, help="Validation TTA passes per epoch")
+    parser.add_argument("--tta", type=int, default=TTA_N, help="Final eval TTA passes")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -715,18 +793,41 @@ def main():
     train_ds, val_ds, feat_dim = build_datasets()
     print(f"Training windows: {len(train_ds)}, Validation windows: {len(val_ds)}")
 
+    use_freq = not args.no_freq
+    use_sam = not args.no_sam
+    use_amp = bool(args.amp)
+    num_workers = int(args.workers)
+    val_interval = int(args.val_interval)
+    val_tta = int(args.val_tta)
+    final_tta = int(args.tta)
+
     # Train PD model
-    pd_model = PDModel(input_dim=feat_dim).to(DEVICE)
-    best_pd = train_pd_model(pd_model, train_ds, val_ds)
+    pd_model = PDModel(input_dim=feat_dim, use_freq=use_freq).to(DEVICE)
+    if args.compile:
+        try:
+            pd_model = torch.compile(pd_model)
+        except Exception as e:
+            print(f"Warning: torch.compile failed for PD model: {e}")
+    best_pd = train_pd_model(pd_model, train_ds, val_ds,
+                             use_sam=use_sam, num_workers=num_workers,
+                             val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp)
 
     # Train Severity model
-    sev_model = SevModel(input_dim=feat_dim).to(DEVICE)
-    best_sev = train_sev_model(sev_model, train_ds, val_ds)
+    sev_model = SevModel(input_dim=feat_dim, use_freq=use_freq).to(DEVICE)
+    if args.compile:
+        try:
+            sev_model = torch.compile(sev_model)
+        except Exception as e:
+            print(f"Warning: torch.compile failed for Sev model: {e}")
+    best_sev = train_sev_model(sev_model, train_ds, val_ds,
+                               use_sam=use_sam, num_workers=num_workers,
+                               val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp)
 
-    # Load best EMA checkpoints and evaluate
+    # Load best EMA checkpoints and evaluate (full TTA)
     pd_model.load_state_dict(torch.load("best_pd_dualstream.pth", map_location=DEVICE))
     sev_model.load_state_dict(torch.load("best_sev_dualstream.pth", map_location=DEVICE))
-    evaluate(pd_model, sev_model, val_ds)
+    evaluate(pd_model, sev_model, val_ds,
+             num_workers=num_workers, tta_n=final_tta, use_amp=use_amp)
 
 
 if __name__ == "__main__":
