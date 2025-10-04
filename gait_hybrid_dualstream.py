@@ -515,7 +515,8 @@ def build_datasets() -> Tuple[WindowDataset, WindowDataset, int]:
 def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDataset,
                    use_sam: bool = USE_SAM, num_workers: int = NUM_WORKERS,
                    val_interval: int = VAL_INTERVAL, val_tta_n: int = VAL_TTA_N,
-                   use_amp: bool = USE_AMP):
+                   use_amp: bool = USE_AMP, epochs: int = EPOCHS_PD,
+                   max_steps_per_epoch: Optional[int] = None):
     # PD-balanced sampling
     pd_counts = Counter(train_ds.pd_labels.tolist())
     pd_w = {c: len(train_ds) / (2 * max(pd_counts.get(c, 1), 1)) for c in [0, 1]}
@@ -542,9 +543,10 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
     ema_model = AveragedModel(model, avg_fn=lambda avg, p, n: EMA_DECAY * avg + (1.0 - EMA_DECAY) * p)
 
     best_pd, wait = 0.0, 0
-    for epoch in range(1, EPOCHS_PD + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         autocast = torch.cuda.amp.autocast if (use_amp and DEVICE.type == 'cuda') else torch.cpu.amp.autocast
+        step = 0
         for x, L, ypd, _, _ in train_loader:
             x, L, ypd = x.to(DEVICE), L.to(DEVICE), ypd.to(DEVICE)
             xa = apply_augmentations(x, L)
@@ -575,6 +577,9 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
 
             # EMA update after optimizer step
             ema_model.update_parameters(model)
+            step += 1
+            if (max_steps_per_epoch is not None) and (step >= max_steps_per_epoch):
+                break
         if isinstance(scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
             scheduler.step(epoch + 1)
         else:
@@ -598,7 +603,7 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
             preds.append(p); trues.append(subj_true[s])
         pd_acc = accuracy_score(trues, preds)
         if epoch % val_interval == 0 or epoch == 1:
-            print(f"[PD] Epoch {epoch:3d}/{EPOCHS_PD} | Val PD Acc: {pd_acc:.3f}")
+            print(f"[PD] Epoch {epoch:3d}/{epochs} | Val PD Acc: {pd_acc:.3f}")
 
         if pd_acc > best_pd:
             best_pd, wait = pd_acc, 0
@@ -617,7 +622,8 @@ def train_pd_model(model: PDModel, train_ds: WindowDataset, val_ds: WindowDatase
 def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowDataset,
                     use_sam: bool = USE_SAM, num_workers: int = NUM_WORKERS,
                     val_interval: int = VAL_INTERVAL, val_tta_n: int = VAL_TTA_N,
-                    use_amp: bool = USE_AMP):
+                    use_amp: bool = USE_AMP, epochs: int = EPOCHS_SEV,
+                    max_steps_per_epoch: Optional[int] = None):
     # Severity-focused sampling
     sev_counts = Counter(train_ds.sev_labels.tolist())
     sev_w = {c: len(train_ds) / (3 * max(sev_counts.get(c, 1), 1)) for c in [0, 1, 2]}
@@ -644,9 +650,10 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
     ema_model = AveragedModel(model, avg_fn=lambda avg, p, n: EMA_DECAY * avg + (1.0 - EMA_DECAY) * p)
 
     best_sev, wait = 0.0, 0
-    for epoch in range(1, EPOCHS_SEV + 1):
+    for epoch in range(1, epochs + 1):
         model.train()
         autocast = torch.cuda.amp.autocast if (use_amp and DEVICE.type == 'cuda') else torch.cpu.amp.autocast
+        step = 0
         for x, L, _, ysev, _ in train_loader:
             x, L, ysev = x.to(DEVICE), L.to(DEVICE), ysev.to(DEVICE)
             xa = apply_augmentations(x, L)
@@ -676,6 +683,9 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
                 optimizer.step()
 
             ema_model.update_parameters(model)
+            step += 1
+            if (max_steps_per_epoch is not None) and (step >= max_steps_per_epoch):
+                break
         if isinstance(scheduler, optim.lr_scheduler.CosineAnnealingWarmRestarts):
             scheduler.step(epoch + 1)
         else:
@@ -699,7 +709,7 @@ def train_sev_model(model: SevModel, train_ds: WindowDataset, val_ds: WindowData
             preds.append(p); trues.append(subj_true[s])
         sev_acc = accuracy_score(trues, preds)
         if epoch % val_interval == 0 or epoch == 1:
-            print(f"[SEV] Epoch {epoch:3d}/{EPOCHS_SEV} | Val Sev Acc: {sev_acc:.3f}")
+            print(f"[SEV] Epoch {epoch:3d}/{epochs} | Val Sev Acc: {sev_acc:.3f}")
 
         if sev_acc > best_sev:
             best_sev, wait = sev_acc, 0
@@ -782,6 +792,9 @@ def main():
     parser.add_argument("--val-interval", type=int, default=VAL_INTERVAL, help="Validate every N epochs")
     parser.add_argument("--val-tta", type=int, default=VAL_TTA_N, help="Validation TTA passes per epoch")
     parser.add_argument("--tta", type=int, default=TTA_N, help="Final eval TTA passes")
+    parser.add_argument("--epochs-pd", type=int, default=EPOCHS_PD, help="PD training epochs")
+    parser.add_argument("--epochs-sev", type=int, default=EPOCHS_SEV, help="Severity training epochs")
+    parser.add_argument("--max-steps", type=int, default=None, help="Max steps per epoch (debug speed)")
     args = parser.parse_args()
 
     set_seed(SEED)
@@ -800,6 +813,9 @@ def main():
     val_interval = int(args.val_interval)
     val_tta = int(args.val_tta)
     final_tta = int(args.tta)
+    epochs_pd = int(args.epochs_pd)
+    epochs_sev = int(args.epochs_sev)
+    max_steps = args.max_steps
 
     # Train PD model
     pd_model = PDModel(input_dim=feat_dim, use_freq=use_freq).to(DEVICE)
@@ -810,7 +826,8 @@ def main():
             print(f"Warning: torch.compile failed for PD model: {e}")
     best_pd = train_pd_model(pd_model, train_ds, val_ds,
                              use_sam=use_sam, num_workers=num_workers,
-                             val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp)
+                             val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp,
+                             epochs=epochs_pd, max_steps_per_epoch=max_steps)
 
     # Train Severity model
     sev_model = SevModel(input_dim=feat_dim, use_freq=use_freq).to(DEVICE)
@@ -821,7 +838,8 @@ def main():
             print(f"Warning: torch.compile failed for Sev model: {e}")
     best_sev = train_sev_model(sev_model, train_ds, val_ds,
                                use_sam=use_sam, num_workers=num_workers,
-                               val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp)
+                               val_interval=val_interval, val_tta_n=val_tta, use_amp=use_amp,
+                               epochs=epochs_sev, max_steps_per_epoch=max_steps)
 
     # Load best EMA checkpoints and evaluate (full TTA)
     pd_model.load_state_dict(torch.load("best_pd_dualstream.pth", map_location=DEVICE))
